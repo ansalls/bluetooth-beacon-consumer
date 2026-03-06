@@ -1,0 +1,20 @@
+[package]
+name = "bluetooth-beacon-consumer"
+version = "0.1.0"
+edition = "2024"
+description = "Bluetooth LE passive monitor for Govee weather sensors"
+
+[dependencies]
+btleplug = "0.11"
+tokio = { version = "1", features = ["full"] }
+chrono = "0.4"
+anyhow = "1"
+futures = "0.3"
+log = "0.4"
+env_logger = "0.11"
+fs2 = "0.4"
+flate2 = "1"
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
