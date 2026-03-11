@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, Legend,
+  Tooltip, ResponsiveContainer,
 } from 'recharts';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -26,6 +26,9 @@ const TIME_RANGES = [
   { label: '30d', ms: 30 * 24 * 3600_000 },
   { label: 'All', ms: null },
 ];
+const REFRESH_INTERVAL_MS = 10_000;
+const PAGE_LIMIT = 10_000;
+const LIVE_POLL_LIMIT = 2_000;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -44,7 +47,8 @@ function formatValue(val, col) {
 
 // Parse "2026-03-05 17:24:30" → Date
 function parseTimestamp(ts) {
-  return ts ? new Date(ts.replace(' ', 'T')) : null;
+  if (!ts) return null;
+  return new Date(ts.includes(' ') ? ts.replace(' ', 'T') : ts);
 }
 
 function fmtAxisTick(ts) {
@@ -65,10 +69,49 @@ function sensorDisplayName(id) {
   return id.replace(/_[0-9A-Fa-f]{2}(_[0-9A-Fa-f]{2}){5}$/, '');
 }
 
-async function apiFetch(url) {
-  const res = await fetch(url);
+async function apiFetch(url, options = {}) {
+  const res = await fetch(url, options);
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
   return res.json();
+}
+
+function buildSensorDataUrl(sensorId, {
+  all = false,
+  since = null,
+  limit = null,
+  offset = null,
+} = {}) {
+  const params = new URLSearchParams();
+  if (all) params.set('all', 'true');
+  if (since) params.set('since', since);
+  if (Number.isInteger(limit)) params.set('limit', String(limit));
+  if (Number.isInteger(offset)) params.set('offset', String(offset));
+  const query = params.toString();
+  return `/api/sensors/${encodeURIComponent(sensorId)}/data${query ? `?${query}` : ''}`;
+}
+
+function rowsFromColumns(columns, rawRows) {
+  return rawRows.map(row => {
+    const obj = {};
+    columns.forEach((col, i) => { obj[col] = row[i]; });
+    return obj;
+  });
+}
+
+function rowIdentity(row, columns) {
+  return columns.map(col => String(row[col] ?? '')).join('\u001F');
+}
+
+function appendUniqueRows(existingRows, incomingRows, columns) {
+  const seen = new Set(existingRows.map(row => rowIdentity(row, columns)));
+  const appended = [...existingRows];
+  incomingRows.forEach(row => {
+    const id = rowIdentity(row, columns);
+    if (seen.has(id)) return;
+    seen.add(id);
+    appended.push(row);
+  });
+  return appended;
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -228,6 +271,7 @@ export default function App() {
   const [selectedId, setSelectedId]   = useState(null);
   const [rawData, setRawData]         = useState(null);
   const [loading, setLoading]         = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError]             = useState(null);
   const [timeRange, setTimeRange]     = useState('7d');
   const [allLoaded, setAllLoaded]     = useState(false);
@@ -245,25 +289,154 @@ export default function App() {
   // Fetch data when sensor selection or allLoaded changes.
   useEffect(() => {
     if (!selectedId) return;
+    const controller = new AbortController();
+    let active = true;
     setLoading(true);
     setError(null);
-    const url = `/api/sensors/${encodeURIComponent(selectedId)}/data${allLoaded ? '?all=true' : ''}`;
-    apiFetch(url)
-      .then(({ columns, rows: rawRows, has_archives }) => {
+    const url = buildSensorDataUrl(selectedId, {
+      all: allLoaded,
+      limit: PAGE_LIMIT,
+      offset: 0,
+    });
+    apiFetch(url, { signal: controller.signal })
+      .then(({
+        columns,
+        rows: rawRows,
+        has_archives,
+        partial = false,
+        next_offset = null,
+        warnings = [],
+      }) => {
         // Convert array rows → objects keyed by column name.
-        const rows = rawRows.map(row => {
-          const obj = {};
-          columns.forEach((col, i) => { obj[col] = row[i]; });
-          return obj;
+        if (!active) return;
+        const rows = rowsFromColumns(columns, rawRows);
+        setRawData({
+          sensor_id: selectedId,
+          columns,
+          rows,
+          has_archives,
+          partial,
+          next_offset,
+          warnings,
         });
-        setRawData({ columns, rows, has_archives });
-        setLoading(false);
       })
-      .catch(e => { setError(e.message); setLoading(false); });
+      .catch(e => {
+        if (!active || e.name === 'AbortError') return;
+        setError(e.message);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
   }, [selectedId, allLoaded]);
 
   // Reset archive state when switching sensors.
-  useEffect(() => { setAllLoaded(false); setRawData(null); }, [selectedId]);
+  useEffect(() => { setAllLoaded(false); setRawData(null); setLoadingMore(false); }, [selectedId]);
+
+  // Incremental live updates: fetch only rows after the latest timestamp in memory.
+  useEffect(() => {
+    if (!selectedId || !rawData) return;
+
+    let cancelled = false;
+    let polling = false;
+
+    const poll = async () => {
+      if (polling || cancelled) return;
+      const since = rawData.rows[rawData.rows.length - 1]?.timestamp;
+      if (!since) return;
+
+      polling = true;
+      try {
+        const url = buildSensorDataUrl(selectedId, {
+          all: allLoaded,
+          since,
+          limit: LIVE_POLL_LIMIT,
+          offset: 0,
+        });
+        const {
+          columns,
+          rows: rawRows,
+          has_archives,
+          partial = false,
+          next_offset = null,
+          warnings = [],
+        } = await apiFetch(url);
+        if (cancelled || rawRows.length === 0) return;
+
+        const newRows = rowsFromColumns(columns, rawRows);
+        setRawData(prev => {
+          if (!prev || prev.sensor_id !== selectedId) return prev;
+          const mergedWarnings = Array.from(new Set([...(prev.warnings ?? []), ...warnings]));
+          if (partial && next_offset != null) {
+            mergedWarnings.push('Live polling hit server row limit; data may be delayed.');
+          }
+          return {
+            sensor_id: prev.sensor_id,
+            columns: prev.columns,
+            rows: appendUniqueRows(prev.rows, newRows, prev.columns),
+            has_archives,
+            partial: prev.partial || partial,
+            next_offset: prev.next_offset,
+            warnings: Array.from(new Set(mergedWarnings)),
+          };
+        });
+      } catch {
+        // Keep current data visible if one poll fails; next tick can recover.
+      } finally {
+        polling = false;
+      }
+    };
+
+    const timer = setInterval(poll, REFRESH_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [selectedId, allLoaded, rawData]);
+
+  async function loadMoreHistory() {
+    if (!selectedId || !rawData?.next_offset || loadingMore) return;
+    setLoadingMore(true);
+    setError(null);
+
+    try {
+      const url = buildSensorDataUrl(selectedId, {
+        all: allLoaded,
+        limit: PAGE_LIMIT,
+        offset: rawData.next_offset,
+      });
+      const {
+        columns,
+        rows: rawRows,
+        has_archives,
+        partial = false,
+        next_offset = null,
+        warnings = [],
+      } = await apiFetch(url);
+
+      const moreRows = rowsFromColumns(columns, rawRows);
+      setRawData(prev => {
+        if (!prev || prev.sensor_id !== selectedId) return prev;
+        return {
+          sensor_id: prev.sensor_id,
+          columns: prev.columns,
+          rows: appendUniqueRows(prev.rows, moreRows, prev.columns),
+          has_archives,
+          partial,
+          next_offset,
+          warnings: Array.from(new Set([...(prev.warnings ?? []), ...warnings])),
+        };
+      });
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }
 
   const { filteredRows, numericCols, latestRow } = useMemo(() => {
     if (!rawData) return { filteredRows: [], numericCols: [], latestRow: null };
@@ -291,6 +464,7 @@ export default function App() {
 
   const sensorInfo   = sensors.find(s => s.id === selectedId);
   const hasArchives  = (sensorInfo?.has_archives ?? rawData?.has_archives) && !allLoaded;
+  const canLoadMoreHistory = Boolean(rawData?.next_offset);
 
   return (
     <div className="app">
@@ -356,10 +530,16 @@ export default function App() {
                 ))}
               </div>
               <div className="toolbar-right">
+                <span className="loading-pill">Live every {REFRESH_INTERVAL_MS / 1000}s</span>
                 {loading && <span className="loading-pill">Refreshing…</span>}
                 {hasArchives && (
                   <button className="btn-archive" onClick={() => setAllLoaded(true)}>
                     Load Full History
+                  </button>
+                )}
+                {canLoadMoreHistory && (
+                  <button className="btn-archive" onClick={loadMoreHistory} disabled={loadingMore}>
+                    {loadingMore ? 'Loading...' : 'Load More Rows'}
                   </button>
                 )}
                 {allLoaded && (
@@ -370,6 +550,12 @@ export default function App() {
                 </span>
               </div>
             </div>
+
+            {rawData.warnings?.length > 0 && (
+              <div className="banner banner-info">
+                {rawData.warnings.join(' ')}
+              </div>
+            )}
 
             {/* ── Summary cards ── */}
             {latestRow && numericCols.length > 0 && (

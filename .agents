@@ -1,0 +1,79 @@
+# bluetooth-beacon-consumer agent guide
+
+This file defines repo-specific requirements for human and automated agents.
+
+## 1) Project goals
+
+- Collect BLE advertisement telemetry from Govee sensors in real time.
+- Persist readings to CSV in `sensor_logs/`, with low operational overhead.
+- Serve a local dashboard + API for near-real-time monitoring and historical review.
+- Keep behavior stable for existing users and automation.
+
+## 2) Architecture summary
+
+- Collector binary: `src/main.rs`
+  - Passive BLE scan using `btleplug`.
+  - Parses manufacturer data for Govee sensors.
+  - Writes one CSV per sensor per month.
+  - Archives old CSVs to `.csv.gz` when older than 3 months.
+- Dashboard/API binary: `src/bin/dashboard.rs`
+  - Axum server on `127.0.0.1:3000`.
+  - Serves JSON APIs and static UI from `ui/dist`.
+- Frontend: `ui/` (React + Vite + Recharts)
+  - Polling view, time-range filters, charts, summary cards, table.
+
+## 3) Non-negotiable compatibility contracts
+
+- Keep API routes stable:
+  - `GET /api/sensors`
+  - `GET /api/sensors/:id/data`
+- Keep `GET /api/sensors/:id/data` response keys stable:
+  - `columns`, `rows`, `has_archives`, `partial`, `next_offset`, `warnings`
+- Keep 404 behavior for unknown sensors on `/api/sensors/:id/data`.
+- Keep query-parameter semantics stable:
+  - `all`, `since`, `limit`, `offset`
+- Keep CSV filename format stable:
+  - `YYYY_MM_<sensor_id>.csv`
+  - archives: `YYYY_MM_<sensor_id>.csv.gz`
+- Keep CSV header columns stable unless a deliberate, documented breaking change is made.
+
+## 4) OATH/OAuth compatibility requirements
+
+The runtime environment may place this service behind an OATH/OAuth-capable gateway.
+Even though this app currently does not implement auth itself, changes must remain
+compatible with gateway-managed auth flows.
+
+- Do not add hard auth requirements directly in app code without an explicit opt-in mode.
+- Do not rename or remove current API paths/status behavior that gateway rules may target.
+- Accept requests with `Authorization` headers without rejecting by default.
+- Avoid adding redirect-to-login behavior in backend handlers.
+- Preserve CORS behavior expected by local/dev tooling unless a migration is planned.
+- If auth is introduced later, make it backward-compatible for local non-auth usage.
+
+## 5) Build and run hints
+
+- Rust checks:
+  - `cargo fmt`
+  - `cargo check`
+  - `cargo test`
+- Frontend build:
+  - `cd ui`
+  - `npm ci`
+  - `npm run build`
+- Run collector:
+  - `cargo run`
+- Run dashboard/API:
+  - `cargo run --bin dashboard`
+
+## 6) Data and performance guardrails
+
+- Maintain append-only logging behavior.
+- Keep file write locking (`fs2`) to prevent interleaved writes.
+- Keep row/page limits and truncation warnings to prevent unbounded responses.
+- Avoid loading entire long-history datasets into memory without pagination controls.
+
+## 7) Change policy
+
+- Prefer additive changes over breaking changes.
+- Update `README.md` and `MANUAL_TESTS.md` when behavior changes.
+- Add or update tests for any parser, API contract, or paging/filter behavior changes.

@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral, ScanFilter};
 use btleplug::platform::Manager;
 use chrono::{Datelike, Local};
-use flate2::{write::GzEncoder, Compression};
+use csv::WriterBuilder;
+use flate2::{Compression, write::GzEncoder};
 use fs2::FileExt;
 use futures::StreamExt;
 use log::{debug, info, warn};
 use std::collections::HashMap;
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,7 +49,10 @@ fn decode_combined(combined: u32) -> (f64, f64) {
         let val = 0x0100_0000u32 - combined;
         (-((val / 1000) as f64) / 10.0, (val % 1000) as f64 / 10.0)
     } else {
-        ((combined / 1000) as f64 / 10.0, (combined % 1000) as f64 / 10.0)
+        (
+            (combined / 1000) as f64 / 10.0,
+            (combined % 1000) as f64 / 10.0,
+        )
     }
 }
 
@@ -70,15 +74,18 @@ fn is_plausible(temp_c: f64, humidity: f64) -> bool {
 ///   Layout B — 5+ byte payload, bytes [1..3] are the encoded value, [4] = battery
 ///     (H5075, H5102, H5179 …).  Byte [0] is a flags/model byte.
 ///
-/// We try Layout A first; if the decoded values are implausible we fall back to
-/// Layout B.  Raw bytes are always logged at debug level.
+/// We try Layout B first; if the decoded values are implausible we fall back to
+/// Layout A. Raw bytes are always logged at debug level.
 fn parse_govee_data(manufacturer_data: &HashMap<u16, Vec<u8>>) -> Option<(f64, f64, Option<u8>)> {
     let data = manufacturer_data.get(&GOVEE_COMPANY_ID)?;
 
     debug!(
         "Govee raw bytes ({}): {}",
         data.len(),
-        data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        data.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
 
     if data.len() < 3 {
@@ -122,21 +129,33 @@ fn is_govee_device(local_name: &Option<String>) -> bool {
 
 fn sanitize_for_filename(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
-const CSV_HEADER: &str =
-    "timestamp,device_name,device_address,temperature_c,temperature_f,humidity_pct,battery_pct,rssi_dbm";
-
 /// Gzip-compress any CSV files in `output_dir` whose `YYYY_MM_` prefix is
-/// more than 3 months before the current month.  Each file is compressed
+/// older than 3 months from the current month. Each file is compressed
 /// individually to `<name>.gz` and the original CSV is removed.
+fn should_archive_file_month(
+    file_year: i32,
+    file_month: i32,
+    now_year: i32,
+    now_month: u32,
+) -> bool {
+    let current_month_index = now_year * 12 + now_month as i32;
+    let file_month_index = file_year * 12 + file_month;
+    let age_in_months = current_month_index - file_month_index;
+    age_in_months > 3
+}
+
 fn archive_old_files(output_dir: &PathBuf) -> Result<()> {
     let now = Local::now();
-    // Express the cutoff as a single comparable integer: year*12 + month.
-    // "More than 3 months prior" means strictly less than (now - 3 months).
-    let cutoff = now.year() as i32 * 12 + now.month() as i32 - 3;
 
     let entries = std::fs::read_dir(output_dir)
         .with_context(|| format!("read_dir {}", output_dir.display()))?;
@@ -153,21 +172,27 @@ fn archive_old_files(output_dir: &PathBuf) -> Result<()> {
         if parts.len() < 2 {
             continue;
         }
-        let file_year: i32 = match parts[0].parse() { Ok(v) => v, Err(_) => continue };
-        let file_month: i32 = match parts[1].parse() { Ok(v) => v, Err(_) => continue };
+        let file_year: i32 = match parts[0].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_month: i32 = match parts[1].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
         if file_year <= 0 || !(1..=12).contains(&file_month) {
             continue;
         }
 
-        if file_year * 12 + file_month > cutoff {
-            continue; // Not old enough yet.
+        if !should_archive_file_month(file_year, file_month, now.year(), now.month()) {
+            continue;
         }
 
         let csv_path = entry.path();
         let gz_path = PathBuf::from(format!("{}.gz", csv_path.display()));
 
-        let csv_data = std::fs::read(&csv_path)
-            .with_context(|| format!("read {}", csv_path.display()))?;
+        let csv_data =
+            std::fs::read(&csv_path).with_context(|| format!("read {}", csv_path.display()))?;
 
         let gz_file = std::fs::File::create(&gz_path)
             .with_context(|| format!("create {}", gz_path.display()))?;
@@ -207,25 +232,44 @@ fn append_reading(path: &PathBuf, output_dir: &PathBuf, r: &SensorReading) -> Re
     // If the file was just created it will be empty — write the header first,
     // then trigger archiving of old monthly files.
     let len = file.seek(SeekFrom::End(0))?;
+    let mut writer = WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(&mut file);
+
     if len == 0 {
-        writeln!(file, "{CSV_HEADER}")?;
+        writer.write_record([
+            "timestamp",
+            "device_name",
+            "device_address",
+            "temperature_c",
+            "temperature_f",
+            "humidity_pct",
+            "battery_pct",
+            "rssi_dbm",
+        ])?;
+        writer.flush()?;
         if let Err(e) = archive_old_files(output_dir) {
             warn!("Archive sweep failed: {e}");
         }
     }
 
-    writeln!(
-        file,
-        "{},{},{},{:.1},{:.1},{:.1},{},{}",
-        r.timestamp,
-        r.device_name,
-        r.device_address,
-        r.temperature_c,
-        r.temperature_f,
-        r.humidity,
-        r.battery_pct.map(|b| b.to_string()).unwrap_or_default(),
-        r.rssi.map(|v| v.to_string()).unwrap_or_default(),
-    )?;
+    let temperature_c = format!("{:.1}", r.temperature_c);
+    let temperature_f = format!("{:.1}", r.temperature_f);
+    let humidity = format!("{:.1}", r.humidity);
+    let battery_pct = r.battery_pct.map(|b| b.to_string()).unwrap_or_default();
+    let rssi_dbm = r.rssi.map(|v| v.to_string()).unwrap_or_default();
+
+    writer.write_record([
+        r.timestamp.as_str(),
+        r.device_name.as_str(),
+        r.device_address.as_str(),
+        temperature_c.as_str(),
+        temperature_f.as_str(),
+        humidity.as_str(),
+        battery_pct.as_str(),
+        rssi_dbm.as_str(),
+    ])?;
+    writer.flush()?;
 
     // Lock released here when `file` is dropped.
     Ok(())
@@ -271,8 +315,7 @@ async fn main() -> Result<()> {
         .context("Failed to subscribe to BLE events")?;
 
     // Track timestamp of last log write per device address.
-    let last_logged: Arc<Mutex<HashMap<String, i64>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let last_logged: Arc<Mutex<HashMap<String, i64>>> = Arc::new(Mutex::new(HashMap::new()));
 
     while let Some(event) = events.next().await {
         match event {
@@ -297,11 +340,10 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let (temp_c, humidity, battery) =
-                    match parse_govee_data(&props.manufacturer_data) {
-                        Some(d) => d,
-                        None => continue,
-                    };
+                let (temp_c, humidity, battery) = match parse_govee_data(&props.manufacturer_data) {
+                    Some(d) => d,
+                    None => continue,
+                };
 
                 let address = props.address.to_string();
                 let device_name = props
@@ -322,7 +364,7 @@ async fn main() -> Result<()> {
                 }
 
                 let temp_f = temp_c * 9.0 / 5.0 + 32.0;
-                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
 
                 let reading = SensorReading {
                     timestamp: timestamp.clone(),
@@ -369,4 +411,255 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        GOVEE_COMPANY_ID, SensorReading, append_reading, archive_old_files, decode_combined,
+        is_govee_device, parse_govee_data, sanitize_for_filename, should_archive_file_month,
+    };
+    use chrono::{Datelike, Local};
+    use flate2::read::GzDecoder;
+    use std::{
+        collections::HashMap,
+        fs::{File, create_dir_all, remove_dir_all, write},
+        io::Read,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn assert_approx_eq(left: f64, right: f64) {
+        assert!(
+            (left - right).abs() < 0.05,
+            "values were not close: left={left}, right={right}"
+        );
+    }
+
+    fn encode_combined(temp_tenths_c: i32, humidity_tenths_pct: u32) -> u32 {
+        if temp_tenths_c < 0 {
+            let magnitude = ((-temp_tenths_c) as u32) * 1000 + humidity_tenths_pct;
+            0x0100_0000 - magnitude
+        } else {
+            (temp_tenths_c as u32) * 1000 + humidity_tenths_pct
+        }
+    }
+
+    fn combined_bytes(combined: u32) -> [u8; 3] {
+        [
+            ((combined >> 16) & 0xFF) as u8,
+            ((combined >> 8) & 0xFF) as u8,
+            (combined & 0xFF) as u8,
+        ]
+    }
+
+    fn make_output_dir(test_name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "bbc_collector_{test_name}_{nonce}_{}",
+            std::process::id()
+        ));
+        create_dir_all(&dir).expect("create temp output dir");
+        dir
+    }
+
+    #[test]
+    fn decode_combined_handles_positive_and_negative_temperatures() {
+        let (temp_pos, hum_pos) = decode_combined(encode_combined(234, 567));
+        assert_approx_eq(temp_pos, 23.4);
+        assert_approx_eq(hum_pos, 56.7);
+
+        let (temp_neg, hum_neg) = decode_combined(encode_combined(-50, 600));
+        assert_approx_eq(temp_neg, -5.0);
+        assert_approx_eq(hum_neg, 60.0);
+    }
+
+    #[test]
+    fn parse_govee_data_prefers_layout_b_when_plausible() {
+        let mut manufacturer_data = HashMap::new();
+        let bytes = combined_bytes(encode_combined(234, 567));
+        manufacturer_data.insert(
+            GOVEE_COMPANY_ID,
+            vec![0x00, bytes[0], bytes[1], bytes[2], 95],
+        );
+
+        let (temp_c, humidity, battery) =
+            parse_govee_data(&manufacturer_data).expect("decode layout B");
+        assert_approx_eq(temp_c, 23.4);
+        assert_approx_eq(humidity, 56.7);
+        assert_eq!(battery, Some(95));
+    }
+
+    #[test]
+    fn parse_govee_data_filters_invalid_layout_b_battery_values() {
+        let mut manufacturer_data = HashMap::new();
+        let bytes = combined_bytes(encode_combined(200, 500));
+        manufacturer_data.insert(
+            GOVEE_COMPANY_ID,
+            vec![0x00, bytes[0], bytes[1], bytes[2], 150],
+        );
+
+        let (_, _, battery) = parse_govee_data(&manufacturer_data).expect("decode layout B");
+        assert_eq!(battery, None);
+    }
+
+    #[test]
+    fn parse_govee_data_uses_layout_a_fallback_when_layout_b_is_implausible() {
+        let mut manufacturer_data = HashMap::new();
+        // Layout B decodes to 100.0C (implausible), so parser should fallback to Layout A:
+        // [0..2] => 0x000F42 => 0.3C / 90.6%.
+        manufacturer_data.insert(GOVEE_COMPANY_ID, vec![0x00, 0x0F, 0x42, 0x40, 90]);
+
+        let (temp_c, humidity, battery) =
+            parse_govee_data(&manufacturer_data).expect("fallback to layout A");
+        assert_approx_eq(temp_c, 0.3);
+        assert_approx_eq(humidity, 90.6);
+        assert_eq!(battery, Some(64));
+    }
+
+    #[test]
+    fn parse_govee_data_accepts_three_byte_layout_a_payloads() {
+        let mut manufacturer_data = HashMap::new();
+        let bytes = combined_bytes(encode_combined(215, 455));
+        manufacturer_data.insert(GOVEE_COMPANY_ID, vec![bytes[0], bytes[1], bytes[2]]);
+
+        let (temp_c, humidity, battery) =
+            parse_govee_data(&manufacturer_data).expect("decode layout A");
+        assert_approx_eq(temp_c, 21.5);
+        assert_approx_eq(humidity, 45.5);
+        assert_eq!(battery, None);
+    }
+
+    #[test]
+    fn parse_govee_data_rejects_missing_or_too_short_payloads() {
+        let no_govee = HashMap::new();
+        assert!(parse_govee_data(&no_govee).is_none());
+
+        let mut short = HashMap::new();
+        short.insert(GOVEE_COMPANY_ID, vec![0x01, 0x02]);
+        assert!(parse_govee_data(&short).is_none());
+    }
+
+    #[test]
+    fn govee_name_filter_and_filename_sanitizer_behave_as_expected() {
+        assert!(is_govee_device(&Some("GVH5075".to_string())));
+        assert!(is_govee_device(&Some("Govee H5102".to_string())));
+        assert!(!is_govee_device(&Some("OtherBrand".to_string())));
+        assert!(!is_govee_device(&None));
+
+        assert_eq!(
+            sanitize_for_filename("Govee H5075/A4:C1"),
+            "Govee_H5075_A4_C1"
+        );
+        assert_eq!(sanitize_for_filename("safe-Name123"), "safe-Name123");
+    }
+
+    #[test]
+    fn archive_old_files_compresses_old_files_and_leaves_current_month() {
+        let dir = make_output_dir("archive_files");
+        let old_csv = dir.join("2000_01_sensor_old.csv");
+        let now = Local::now();
+        let current_csv = dir.join(format!(
+            "{:04}_{:02}_sensor_current.csv",
+            now.year(),
+            now.month()
+        ));
+
+        write(&old_csv, "timestamp,device_name\n2026-03-10 00:00:00,old\n").expect("write old csv");
+        write(
+            &current_csv,
+            "timestamp,device_name\n2026-03-10 00:00:00,current\n",
+        )
+        .expect("write current csv");
+
+        archive_old_files(&dir).expect("archive sweep should succeed");
+
+        assert!(!old_csv.exists(), "old csv should be removed");
+        let old_gz = PathBuf::from(format!("{}.gz", old_csv.display()));
+        assert!(old_gz.exists(), "old csv should be compressed");
+        assert!(
+            current_csv.exists(),
+            "current-month csv should not be archived"
+        );
+
+        let mut decoded = String::new();
+        let file = File::open(&old_gz).expect("open archived file");
+        let mut decoder = GzDecoder::new(file);
+        decoder
+            .read_to_string(&mut decoded)
+            .expect("decompress archived file");
+        assert!(decoded.contains("timestamp,device_name"));
+
+        remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn append_reading_writes_header_once_and_appends_rows() {
+        let dir = make_output_dir("append_reading");
+        let now = Local::now();
+        let path = dir.join(format!(
+            "{:04}_{:02}_sensor_alpha_A4.csv",
+            now.year(),
+            now.month()
+        ));
+
+        let reading_one = SensorReading {
+            timestamp: "2026-03-10 12:00:00.000".to_string(),
+            device_name: "sensor_alpha".to_string(),
+            device_address: "A4".to_string(),
+            temperature_c: 21.5,
+            temperature_f: 70.7,
+            humidity: 45.5,
+            battery_pct: Some(88),
+            rssi: Some(-45),
+        };
+        let reading_two = SensorReading {
+            timestamp: "2026-03-10 12:01:00.000".to_string(),
+            device_name: "sensor_alpha".to_string(),
+            device_address: "A4".to_string(),
+            temperature_c: 21.6,
+            temperature_f: 70.9,
+            humidity: 45.6,
+            battery_pct: None,
+            rssi: None,
+        };
+
+        append_reading(&path, &dir, &reading_one).expect("append first reading");
+        append_reading(&path, &dir, &reading_two).expect("append second reading");
+
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_path(&path)
+            .expect("open csv");
+        let headers = reader.headers().expect("read headers").clone();
+        assert_eq!(headers.len(), 8);
+        assert_eq!(&headers[0], "timestamp");
+        assert_eq!(&headers[7], "rssi_dbm");
+
+        let rows = reader
+            .records()
+            .map(|r| r.expect("valid row"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "header should only be written once");
+        assert_eq!(&rows[0][0], "2026-03-10 12:00:00.000");
+        assert_eq!(&rows[0][6], "88");
+        assert_eq!(&rows[0][7], "-45");
+        assert_eq!(&rows[1][0], "2026-03-10 12:01:00.000");
+        assert_eq!(&rows[1][6], "");
+        assert_eq!(&rows[1][7], "");
+
+        remove_dir_all(dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn archives_only_when_older_than_three_months() {
+        // Current month: March 2026.
+        assert!(!should_archive_file_month(2026, 3, 2026, 3)); // 0 months old
+        assert!(!should_archive_file_month(2026, 1, 2026, 3)); // 2 months old
+        assert!(!should_archive_file_month(2025, 12, 2026, 3)); // exactly 3 months old
+        assert!(should_archive_file_month(2025, 11, 2026, 3)); // 4 months old
+    }
 }
