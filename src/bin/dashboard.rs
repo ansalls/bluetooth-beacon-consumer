@@ -237,10 +237,10 @@ async fn get_sensor_data(
 
     'scan: for path in &paths {
         let header = for_each_csv_row(path, |row| {
-            if let Some(since_raw) = since {
-                if !row_is_after_or_equal_since(&row, since_raw, since_parsed) {
-                    return true;
-                }
+            if let Some(since_raw) = since
+                && !row_is_after_or_equal_since(&row, since_raw, since_parsed)
+            {
+                return true;
             }
 
             matched_count = matched_count.saturating_add(1);

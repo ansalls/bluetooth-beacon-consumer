@@ -1,52 +1,103 @@
-use anyhow::{Context, Result};
-use btleplug::api::Central;
-use futures::StreamExt;
-use log::{debug, warn};
+//! Archive management
+//!
+//! Handles compression and archival of old CSV files.
+
+use anyhow::Result;
+use chrono::{Datelike, Local};
+use flate2::{Compression, write::GzEncoder};
+use std::fs::{File, read_dir, remove_file};
+use std::io::{Write, BufReader};
 use std::path::PathBuf;
 
-mod sensor;
-mod storage;
-mod ble;
+/// Check if a file with the given `YYYY_MM_` prefix should be archived.
+///
+/// Files older than 3 months from the current date should be archived.
+#[allow(dead_code)]
+pub fn should_archive_file_month(
+    file_year: i32,
+    file_month: i32,
+    now_year: i32,
+    now_month: u32,
+) -> bool {
+    let current_month_index = now_year * 12 + now_month as i32;
+    let file_month_index = file_year * 12 + file_month;
+    let age_in_months = current_month_index - file_month_index;
+    age_in_months > 3
+}
 
-use ble::{initialize_ble_scanner, process_device_event};
+/// Gzip-compress any CSV files in `output_dir` whose `YYYY_MM_` prefix is
+/// older than 3 months from the current month. Each file is compressed
+/// individually to `<name>.gz` and the original CSV is removed.
+#[allow(dead_code)]
+pub fn archive_old_files(output_dir: &PathBuf) -> Result<()> {
+    let now = Local::now();
+    let now_year = now.year();
+    let now_month = now.month();
 
-/// Directory where CSV log files are written.
-const OUTPUT_DIR: &str = "sensor_logs";
+    for entry in read_dir(output_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = match path.file_name() {
+            Some(n) => match n.to_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            },
+            None => continue,
+        };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::init();
-
-    let output_dir = PathBuf::from(OUTPUT_DIR);
-
-    // Initialize BLE scanner
-    let (adapter, last_logged) = initialize_ble_scanner(&output_dir).await?;
-
-    // Subscribe to BLE events
-    let mut events = adapter
-        .events()
-        .await
-        .context("Failed to subscribe to BLE events")?;
-
-    // Process device events
-    while let Some(event) = events.next().await {
-        match event {
-            btleplug::api::CentralEvent::DeviceDiscovered(id)
-            | btleplug::api::CentralEvent::DeviceUpdated(id) => {
-                let peripheral = match adapter.peripheral(&id).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        debug!("peripheral({id:?}): {e}");
-                        continue;
-                    }
-                };
-
-                if let Err(e) = process_device_event(&peripheral, &output_dir, &last_logged).await {
-                    warn!("Device processing error: {e}");
-                }
-            }
-            _ => {}
+        // Only process .csv files
+        if !file_name.ends_with(".csv") {
+            continue;
         }
+
+        // Extract year/month from filename like "2000_01_sensor_old.csv"
+        let parts: Vec<&str> = file_name.split('_').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let file_year: i32 = match parts[0].parse() {
+            Ok(y) => y,
+            Err(_) => continue,
+        };
+
+        let file_month: i32 = match parts[1].parse() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        // Validate year and month ranges
+        if file_year <= 0 || !(1..=12).contains(&file_month) {
+            continue;
+        }
+
+        // Check if should be archived
+        if !should_archive_file_month(file_year, file_month, now_year, now_month) {
+            continue;
+        }
+
+        // Archive the file
+        let input_file = File::open(&path)?;
+        let reader = BufReader::new(input_file);
+
+        let gz_path = format!("{}.gz", path.display());
+        let gz_file = File::create(&gz_path)?;
+        let mut encoder = GzEncoder::new(gz_file, Compression::default());
+
+        let mut buffer = vec![0; 8192];
+        let mut reader = std::io::BufReader::new(reader);
+        loop {
+            let n = std::io::Read::read(&mut reader, &mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            encoder.write_all(&buffer[..n])?;
+        }
+
+        encoder.finish()?;
+
+        // Remove the original CSV file
+        remove_file(&path)?;
     }
 
     Ok(())
@@ -54,17 +105,11 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::{append_reading};
-    use crate::storage::archive::{should_archive_file_month, archive_old_files};
-    use crate::sensor::SensorReading;
-    use chrono::{Datelike, Local};
+    use super::*;
+    use std::fs::{create_dir_all, remove_dir_all, write};
+    use std::io::Read;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use flate2::read::GzDecoder;
-    use std::{
-        fs::{File, create_dir_all, remove_dir_all, write},
-        io::Read,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
     fn make_output_dir(test_name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -148,7 +193,6 @@ mod tests {
         remove_dir_all(dir).expect("cleanup temp dir");
     }
 
-
     #[test]
     fn archive_old_files_compresses_old_files_and_leaves_current_month() {
         let dir = make_output_dir("archive_files");
@@ -184,64 +228,6 @@ mod tests {
             .read_to_string(&mut decoded)
             .expect("decompress archived file");
         assert!(decoded.contains("timestamp,device_name"));
-
-        remove_dir_all(dir).expect("cleanup temp dir");
-    }
-
-    #[test]
-    fn append_reading_writes_header_once_and_appends_rows() {
-        let dir = make_output_dir("append_reading");
-        let now = Local::now();
-        let path = dir.join(format!(
-            "{:04}_{:02}_sensor_alpha_A4.csv",
-            now.year(),
-            now.month()
-        ));
-
-        let reading_one = SensorReading {
-            timestamp: "2026-03-10 12:00:00.000".to_string(),
-            device_name: "sensor_alpha".to_string(),
-            device_address: "A4".to_string(),
-            temperature_c: 21.5,
-            temperature_f: 70.7,
-            humidity: 45.5,
-            battery_pct: Some(88),
-            rssi: Some(-45),
-        };
-        let reading_two = SensorReading {
-            timestamp: "2026-03-10 12:01:00.000".to_string(),
-            device_name: "sensor_alpha".to_string(),
-            device_address: "A4".to_string(),
-            temperature_c: 21.6,
-            temperature_f: 70.9,
-            humidity: 45.6,
-            battery_pct: None,
-            rssi: None,
-        };
-
-        append_reading(&path, &dir, &reading_one).expect("append first reading");
-        append_reading(&path, &dir, &reading_two).expect("append second reading");
-
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(true)
-            .from_path(&path)
-            .expect("open csv");
-        let headers = reader.headers().expect("read headers").clone();
-        assert_eq!(headers.len(), 8);
-        assert_eq!(&headers[0], "timestamp");
-        assert_eq!(&headers[7], "rssi_dbm");
-
-        let rows = reader
-            .records()
-            .map(|r| r.expect("valid row"))
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 2, "header should only be written once");
-        assert_eq!(&rows[0][0], "2026-03-10 12:00:00.000");
-        assert_eq!(&rows[0][6], "88");
-        assert_eq!(&rows[0][7], "-45");
-        assert_eq!(&rows[1][0], "2026-03-10 12:01:00.000");
-        assert_eq!(&rows[1][6], "");
-        assert_eq!(&rows[1][7], "");
 
         remove_dir_all(dir).expect("cleanup temp dir");
     }
