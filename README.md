@@ -1,39 +1,43 @@
 # Bluetooth Beacon Consumer
 
-BLE passive monitor for Govee weather sensors with:
+> Rust passive BLE monitor for Govee weather sensors; logs readings and exposes a local HTTP API.
 
-- real-time CSV logging (`sensor_logs/`)
-- automatic archival of old monthly files (`.csv.gz`)
-- a local dashboard and JSON API for live/historical analysis
+## Summary
 
-## Current State
+Bluetooth Beacon Consumer is a Rust application that passively listens for BLE
+advertisements from Govee weather sensors, decodes their temperature and humidity
+payloads, and writes one CSV per sensor per month under `sensor_logs/`. A companion
+dashboard binary serves a JSON API plus a built React frontend on `127.0.0.1:3000`
+for live and historical analysis.
 
-The project currently ships two Rust binaries and one frontend:
+The collector handles two Govee payload layouts (A and B), rate-limits per-device
+writes to once every 60 seconds, and archives CSVs older than three months as
+`.csv.gz`. The dashboard reads both plain and archived files and supports
+filtering and offset paging for large histories.
 
-- `src/main.rs` (`cargo run`)
-  - BLE collector/logger
-  - Govee payload parsing (layout A/B)
-  - one CSV per sensor per month
-  - per-device write rate limiting (60s)
-  - archive sweep for files older than 3 months
-- `src/bin/dashboard.rs` (`cargo run --bin dashboard`)
-  - serves API + built frontend on `127.0.0.1:3000`
-  - reads both `.csv` and `.csv.gz`
-  - supports filtering and paging for large history
-- `ui/` (React + Vite)
-  - live polling every 10s
-  - load full history + load more paging
-  - chart cards + summary cards + sortable/paged table
+## Capabilities
 
-## Requirements
+- **Passive BLE collection** — listens for Govee advertisements and decodes layout A and B payloads.
+- **Per-sensor monthly CSV logs** — one file per device per month under `sensor_logs/`, file-locked against concurrent writes.
+- **Per-device rate limiting** — caps each sensor's write cadence to once every 60 seconds.
+- **Automatic archival** — gzips CSV files older than three months on new-file initialization.
+- **Local HTTP API** — Axum-based JSON API exposes sensor inventory and historical rows on `127.0.0.1:3000`.
+- **Bundled dashboard frontend** — React + Vite UI with live polling, paged history, charts, and time filters.
+
+## Status
+
+Two Rust binaries (`bluetooth-beacon-consumer`, `dashboard`) plus a `ui/` React
+frontend, edition 2024. Requires a host Bluetooth adapter for the collector.
+
+## Prerequisites
 
 - Rust toolchain (edition 2024; stable recommended)
-- Node.js 18+ (for frontend build)
-- Bluetooth adapter enabled for collector runtime
+- Node.js 18+ for building the frontend
+- A Bluetooth adapter enabled on the host for the collector runtime
 
-## Quick Start
+## Setup
 
-### 1) Build the UI
+Build the UI once before running the dashboard:
 
 ```bash
 cd ui
@@ -41,7 +45,9 @@ npm ci
 npm run build
 ```
 
-### 2) Run the collector (writes sensor logs)
+## Usage
+
+Run the collector (writes sensor logs):
 
 ```bash
 cargo run
@@ -53,25 +59,28 @@ Output files are written to:
 sensor_logs/YYYY_MM_<DeviceName>_<Address>.csv
 ```
 
-### 3) Run dashboard/API
+Run the dashboard / API:
 
 ```bash
 cargo run --bin dashboard
 ```
 
-Open:
+Then open `http://127.0.0.1:3000`.
 
-```text
-http://127.0.0.1:3000
-```
+### Frontend behavior
 
-## API
+- Sensor selection driven by `/api/sensors`.
+- Initial load from `/api/sensors/:id/data?limit=10000&offset=0`.
+- Live polling every 10s using `since=<latest_timestamp>`.
+- "Load Full History" enables archive inclusion (`all=true`).
+- "Load More Rows" follows `next_offset` paging.
+- Time filters: `24h`, `7d`, `30d`, `All` (client-side filter).
+
+## HTTP API
 
 ### `GET /api/sensors`
 
 Returns available sensor IDs and archive availability.
-
-Example:
 
 ```json
 [
@@ -104,30 +113,29 @@ Response:
 
 Notes:
 
-- unknown sensor ID returns `404`
-- timestamp column is always returned as string
-- non-finite numbers (for example `NaN`) remain strings in JSON
-- malformed/unreadable files produce `partial=true` with warning text
+- Unknown sensor ID returns `404`.
+- The timestamp column is always returned as a string.
+- Non-finite numbers (for example `NaN`) remain strings in JSON.
+- Malformed or unreadable files produce `partial=true` with warning text.
 
-## Frontend behavior
+### Auth posture
 
-- Sensor selection from `/api/sensors`
-- Initial load from `/api/sensors/:id/data?limit=10000&offset=0`
-- Live polling every 10s using `since=<latest_timestamp>`
-- "Load Full History" enables archive inclusion (`all=true`)
-- "Load More Rows" follows `next_offset` paging
-- Time filters: `24h`, `7d`, `30d`, `All` (client-side filter)
+The service is auth-neutral — no built-in login flow — and is commonly run behind
+gateway-managed auth in some environments. Compatibility rules:
 
-## Logging and archival behavior
+- Preserve route and response contracts used by gateway and clients.
+- Do not introduce mandatory app-level auth by default.
+- Do not add redirect-based login behavior to API handlers.
+- Remain compatible with forwarded `Authorization` headers.
 
-- Collector writes CSV header once per file.
-- Writes are file-locked to avoid concurrent write corruption.
-- Archive policy: file month must be older than 3 months from current month.
-- Archival happens during new-file initialization.
+## Architecture
 
-## Tests
+The collector writes the CSV header once per file. Writes are file-locked to
+avoid concurrent write corruption. Archive policy: a file's month must be
+older than three months from the current month, and archival happens during
+new-file initialization.
 
-Run:
+## Testing
 
 ```bash
 cargo fmt
@@ -138,21 +146,8 @@ cargo test
 Coverage includes:
 
 - Govee payload decode/validation paths
-- append and archive file behaviors
+- Append and archive file behaviors
 - API-level behavior (404, paging, filtering, archive inclusion, warnings)
 
-## OATH/OAuth compatibility
-
-This service is commonly run behind gateway-managed auth in some environments.
-Current app behavior is auth-neutral (no built-in login flow). Compatibility rules:
-
-- preserve route and response contracts used by gateway and clients
-- do not introduce mandatory app-level auth by default
-- do not add redirect-based login behavior to API handlers
-- remain compatible with forwarded `Authorization` headers
-
-## Manual end-to-end validation
-
-See the full production-style test runbook:
-
-- [MANUAL_TESTS.md](./MANUAL_TESTS.md)
+For manual end-to-end validation, see the production-style runbook in
+[MANUAL_TESTS.md](./MANUAL_TESTS.md).
