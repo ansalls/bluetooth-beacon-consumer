@@ -223,8 +223,8 @@ The dashboard's `readmeParser` extracts:
 
 Both are surfaced on the Tomes page when a project has a local clone with a conforming README.
 Projects without these sections still render — they just fall back to the one-line description
-from the master table at
-<https://gitlab.epic.com/tsalls/claude-projects-list/-/blob/main/README.md>.
+from the master table in
+[claude-projects-list's README](https://gitlab.epic.com/tsalls/claude-projects-list/-/blob/main/README.md).
 
 ## Maintenance
 
