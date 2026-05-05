@@ -1,4 +1,4 @@
-# <Project Name>
+# `Project Name`
 
 <!-- Tagline: a one-sentence elevator pitch. Optional but recommended. Example: -->
 <!-- > A persistent HTTP wrapper around a local agent backend CLI for scripted triggers. -->
@@ -18,9 +18,9 @@ no headings, code blocks, images, or tables in this section.
 <!-- high-level themes and list the full inventory under ## Tools below.        -->
 <!-- For content/curation repos, list collection or category names instead of   -->
 <!-- code features (e.g. "**Code review prompts** — patterns for PR review.").  -->
-- **<Capability>** — <one-line description of what it does today>.
-- **<Capability>** — <one-line description>.
-- **<Capability>** — <one-line description>.
+- **`Capability`** — `one-line description of what it does today`.
+- **`Capability`** — `one-line description`.
+- **`Capability`** — `one-line description`.
 
 ## Status
 
