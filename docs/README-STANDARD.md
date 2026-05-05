@@ -229,5 +229,5 @@ from the master table in
 ## Maintenance
 
 When you create, fork, or significantly refactor a project, ensure its README still conforms.
-The repo-local [`AGENTS.md`](../AGENTS.md) instructs Claude/Codex agents to keep the README
-aligned with this standard.
+The repo-local `AGENTS.md` instructs Claude/Codex agents to keep the README aligned with
+this standard.
