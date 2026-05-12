@@ -1,3 +1,5 @@
 sensor_logs/*
 target/*
 ui/node_modules/*
+.codex/
+.codex/config.toml

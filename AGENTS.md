@@ -4,6 +4,10 @@ Instructions for Claude Code, Codex, and other coding agents working in this rep
 (or any repo that adopts this file). Drop this file at the repository root so it
 loads automatically.
 
+The canonical source for this shared agent guidance is
+[`claude-projects-list`](https://gitlab.epic.com/tsalls/claude-projects-list).
+When changing shared instructions, update that repo and sync the copy outward.
+
 ## README format
 
 This repo follows the cross-project README standard maintained at
@@ -72,3 +76,13 @@ A copy-paste scaffold is in [`docs/README-template.md`](./docs/README-template.m
 - Edit existing files; don't add new top-level docs unless necessary.
 - Keep commit messages concise and imperative ("Add Capabilities to Tomes pane").
 - Don't restructure unrelated files in a single change.
+- GitLab CI jobs that use shared Docker/Kubernetes runners must set the runner
+  tag explicitly. Match Atlas with a top-level `default: tags: [k8s]`; this is a
+  runner selection tag, not a release/version Git tag.
+- Before pushing, run the closest local equivalent of the GitLab jobs for the
+  repo: tests, builds, linters/typechecks, packaging, or docs checks. If a
+  CI-only step cannot run locally, document the gap in the issue or MR note.
+- Codex MCP defaults are defined by Atlas's tracked `.codex/config.toml`. Keep
+  only `chrome-devtools`, `toasty`, and `hubble` active by default there. In
+  sibling repos, `.codex/` and `.codex/config.toml` are local machine config and
+  should stay ignored by git.
